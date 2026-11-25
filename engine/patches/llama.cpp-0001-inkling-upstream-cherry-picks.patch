@@ -1,0 +1,1328 @@
+From af03aad0bd67b178da0b90f41bdad31a7d799dd9 Mon Sep 17 00:00:00 2001
+From: Xuan-Son Nguyen <son@huggingface.co>
+Date: Sat, 21 Nov 2026 16:30:01 +0100
+Subject: [PATCH 1/2] model: apply .scale tensors automatically + fix
+ correctness (#32669)
+
+* model: apply .scale tensors automatically
+
+* rm build_moe_ffn "_s" overload
+
+* use llama_prec_policy
+
+* fix ci
+
+* build_lora_mm_id: rm w_s
+---
+ ggml/src/ggml-backend-meta.cpp |  42 ++++++-----
+ src/llama-graph.cpp            | 134 ++++++---------------------------
+ src/llama-graph.h              |   8 +-
+ src/llama-model.cpp            |  56 +++++++++++++-
+ src/llama-model.h              |  14 +++-
+ src/models/clover-moe.cpp      |   5 +-
+ src/models/cohere2moe.cpp      |  10 +--
+ src/models/deepseek32.cpp      |  10 +--
+ src/models/deepseek4.cpp       |   3 -
+ src/models/deepseek41.cpp      |   4 +-
+ src/models/dots3note.cpp       |   5 +-
+ src/models/flint.cpp           |   5 +-
+ src/models/gemma4.cpp          |   5 +-
+ src/models/glm-dsa.cpp         |  10 +--
+ src/models/glm4-moe.cpp        |   5 ++
+ src/models/glm4.cpp            |   4 +
+ src/models/granite-hybrid.cpp  |   6 +-
+ src/models/granite-swa.cpp     |   5 +-
+ src/models/granite.cpp         |   6 +-
+ src/models/hy-v3.cpp           |  10 +--
+ src/models/inkling2.cpp        |   7 +-
+ src/models/jais2.cpp           |   4 +
+ src/models/kolibri1.cpp        |   2 +-
+ src/models/lfm-base.cpp        |   7 +-
+ src/models/llama.cpp           |   6 +-
+ src/models/mellum.cpp          |  12 +--
+ src/models/metis16.cpp         |   2 +-
+ src/models/minimax-m3.cpp      |   5 +-
+ src/models/mistral-large4.cpp  |   5 +-
+ src/models/mistral3.cpp        |   6 +-
+ src/models/muse-spark.cpp      |   2 +-
+ src/models/nemotron-h-moe.cpp  |   5 +-
+ src/models/nemotron-h.cpp      |   5 +-
+ src/models/qwen35moe.cpp       |  10 +--
+ src/models/qwen3moe.cpp        |   6 +-
+ src/models/qwen3next.cpp       |  10 +--
+ src/models/qwen4exp.cpp        |   5 +-
+ src/models/zaya1.cpp           |   3 -
+ tests/fusion/MTL.csv           |   5 +-
+ 39 files changed, 164 insertions(+), 290 deletions(-)
+
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index 595a5824a..c4e37ed46 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -2154,8 +2154,28 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                     }
+                 };
+ 
+-                skip_unrelated();
+-                if (id + 1 >= cgraph->n_nodes) {
++                // Chain of MULs with MIRRORED src[1], returns false at the end of the graph
++                auto absorb_muls = [&]() -> bool {
++                    while (true) {
++                        skip_unrelated();
++                        if (id + 1 >= cgraph->n_nodes) {
++                            return false;
++                        }
++                        ggml_tensor * next = cgraph->nodes[id+1];
++                        if (next->op == GGML_OP_MUL && next->src[0] == node &&
++                                ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
++                            node = next;
++                            id++;
++                            idr = id;
++                            n_used = ggml_node_get_use_count(cgraph, id);
++                        } else {
++                            return true;
++                        }
++                    }
++                };
++
++                // MULs before the PARTIAL bias (e.g. a per-expert weight scale): sum_j(s*p_j + b/n) == s*sum_j(p_j) + b
++                if (!absorb_muls()) {
+                     return idr;
+                 }
+                 {
+@@ -2169,22 +2189,8 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend,
+                         n_used = ggml_node_get_use_count(cgraph, id);
+                     }
+                 }
+-                // Chain of MULs with MIRRORED src[1]
+-                while (true) {
+-                    skip_unrelated();
+-                    if (id + 1 >= cgraph->n_nodes) {
+-                        return idr;
+-                    }
+-                    ggml_tensor * next = cgraph->nodes[id+1];
+-                    if (next->op == GGML_OP_MUL && next->src[0] == node &&
+-                            ggml_backend_meta_get_split_state(next->src[1], false).axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+-                        node = next;
+-                        id++;
+-                        idr = id;
+-                        n_used = ggml_node_get_use_count(cgraph, id);
+-                    } else {
+-                        break;
+-                    }
++                if (!absorb_muls()) {
++                    return idr;
+                 }
+ 
+                 if (n_used != node->ne[1] || id + 2*n_used-1 >= cgraph->n_nodes) {
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 269b920fb..b9b8c5811 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1809,16 +1809,21 @@ ggml_tensor * llm_graph_context::build_lora_mm(
+           ggml_tensor * w,
+           ggml_tensor * cur,
+           ggml_tensor * w_s) const {
++    if (!w_s) {
++        w_s = model.get_w_scale(w);
++    }
++
+     // a Hadamard-folded weight reads the transformed input; a LoRA delta lives in the primal basis and reads `cur`
+     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
+ 
+-    prec_policy.apply(res);
+-
+     if (w->type == GGML_TYPE_NVFP4) {
+         ggml_prec_set_acc(res, GGML_PREC_BF16);
+     }
+ 
++
++    prec_policy.apply(res);
++
+     if (w_s) {
+         res = ggml_mul(ctx0, res, w_s);
+     }
+@@ -1885,9 +1890,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+           ggml_tensor * w,   // ggml_tensor * as
+           ggml_tensor * cur, // ggml_tensor * b
+           ggml_tensor * ids,
+-          ggml_tensor * w_s,
+           ggml_tensor * slots,
+                  bool   cached) const {
++    ggml_tensor * w_s = model.get_w_scale(w);
++
+     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
+     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
+     // the experts in the MoE cache are selected by their slots
+@@ -1895,12 +1901,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
+         ggml_mul_mat_id(ctx0, cached ? moe_cache->get_experts(w) : w, cur_mm, slots);
+ 
+-    prec_policy.apply(res);
+-
+     if (w->type == GGML_TYPE_NVFP4) {
+         ggml_prec_set_acc(res, GGML_PREC_BF16);
+     }
+ 
++    // after the NVFP4 default, so that the policy can request a higher precision
++    prec_policy.apply(res);
++
+     if (w_s) {
+         const int64_t n_expert = w_s->ne[0];
+         const int64_t n_tokens = cur->ne[2];
+@@ -2114,34 +2121,7 @@ ggml_tensor * llm_graph_context::build_ffn(
+                  int   il) const {
+     const llm_arch arch = model.arch;
+ 
+-    // NVFP4 support is currently restricted to
+-    // 1) LORA absence (*_s would be applied after LORA residual, which is incorrect)
+-    // 2) bias absense (*_s would be applied after bias addition, which is incorrect)
+-    // TODO: disambiguate LLM-architectural scales (which use *_s) from NVFP4 scale_2 (which also uses *_s currently)
+-    auto has_lora = [this](ggml_tensor * w) {
+-        if (!w) {
+-            return false;
+-        }
+-        for (const auto & lora : *loras) {
+-            if (lora.first->get_weight(w) != nullptr) {
+-                return true;
+-            }
+-        }
+-        return false;
+-    };
+-
+-    auto is_scaled_low_precision = [](ggml_tensor * w) {
+-        return w && (w->type == GGML_TYPE_NVFP4 || w->type == GGML_TYPE_F8_E4M3);
+-    };
+-
+-    GGML_ASSERT(!up_s   || !up_b   || !is_scaled_low_precision(up));
+-    GGML_ASSERT(!gate_s || !gate_b || !is_scaled_low_precision(gate));
+-    GGML_ASSERT(!down_s || !down_b || !is_scaled_low_precision(down));
+-    GGML_ASSERT(!up_s   || !is_scaled_low_precision(up)   || !has_lora(up));
+-    GGML_ASSERT(!gate_s || !is_scaled_low_precision(gate) || !has_lora(gate));
+-    GGML_ASSERT(!down_s || !is_scaled_low_precision(down) || !has_lora(down));
+-
+-    ggml_tensor * tmp = up ? build_lora_mm(up, cur) : cur;
++    ggml_tensor * tmp = up ? build_lora_mm(up, cur, up_s) : cur;
+     cb(tmp, "ffn_up", il);
+ 
+     if (up_b) {
+@@ -2149,21 +2129,16 @@ ggml_tensor * llm_graph_context::build_ffn(
+         cb(tmp, "ffn_up_b", il);
+     }
+ 
+-    if (up_s) {
+-        tmp = ggml_mul(ctx0, tmp, up_s);
+-        cb(tmp, "ffn_up_s", il);
+-    }
+-
+     if (gate) {
+         switch (type_gate) {
+             case LLM_FFN_SEQ:
+                 {
+-                    cur = build_lora_mm(gate, tmp);
++                    cur = build_lora_mm(gate, tmp, gate_s);
+                     cb(cur, "ffn_gate", il);
+                 } break;
+             case LLM_FFN_PAR:
+                 {
+-                    cur = build_lora_mm(gate, cur);
++                    cur = build_lora_mm(gate, cur, gate_s);
+                     cb(cur, "ffn_gate", il);
+                 } break;
+         }
+@@ -2173,11 +2148,6 @@ ggml_tensor * llm_graph_context::build_ffn(
+             cb(cur, "ffn_gate_b", il);
+         }
+ 
+-        if (gate_s) {
+-            cur = ggml_mul(ctx0, cur, gate_s);
+-            cb(cur, "ffn_gate_s", il);
+-        }
+-
+     } else {
+         cur = tmp;
+     }
+@@ -2299,11 +2269,7 @@ ggml_tensor * llm_graph_context::build_ffn(
+     }
+ 
+     if (down) {
+-        cur = build_lora_mm(down, cur);
+-        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
+-            // GLM4, GLM4_MOE, and JAIS2 have numerical issues with F16 accumulators
+-            ggml_prec_set_acc(cur, GGML_PREC_BF16);
+-        }
++        cur = build_lora_mm(down, cur, down_s);
+     }
+ 
+     if (down_b) {
+@@ -2314,11 +2280,6 @@ ggml_tensor * llm_graph_context::build_ffn(
+         cur = ggml_add(ctx0, cur, down_b);
+     }
+ 
+-    if (down_s) {
+-        cur = ggml_mul(ctx0, cur, down_s);
+-        cb(cur, "ffn_down_s", il);
+-    }
+-
+     return cur;
+ }
+ 
+@@ -2338,9 +2299,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                  int   il,
+          ggml_tensor * probs_in,
+          ggml_tensor * gate_up_exps,
+-         ggml_tensor * up_exps_s,
+-         ggml_tensor * gate_exps_s,
+-         ggml_tensor * down_exps_s,
+          ggml_tensor * selected_experts_in,
+          ggml_tensor * post_exp_norm,
+                float   post_exp_norm_eps) const {
+@@ -2361,9 +2319,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         probs_in,
+         gate_up_exps,
+         /* gate_up_exps_b */ nullptr,
+-        up_exps_s,
+-        gate_exps_s,
+-        down_exps_s,
+         selected_experts_in,
+         post_exp_norm,
+         post_exp_norm_eps
+@@ -2391,9 +2346,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * probs_in,
+          ggml_tensor * gate_up_exps,
+          ggml_tensor * gate_up_exps_b,
+-         ggml_tensor * up_exps_s,
+-         ggml_tensor * gate_exps_s,
+-         ggml_tensor * down_exps_s,
+          ggml_tensor * selected_experts_in,
+          ggml_tensor * post_exp_norm,
+                float   post_exp_norm_eps) const {
+@@ -2406,10 +2358,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+     if (probs_in == nullptr) {
+         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
+-        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS || hparams.expert_router_f32) {
+-            // the reference computes the router in F32: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L565
+-            ggml_prec_set_acc(logits, GGML_PREC_F32);
+-        }
+         cb(logits, "ffn_moe_logits", il);
+     } else {
+         logits = probs_in;
+@@ -2582,13 +2530,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+ 
+         if (gate_up_exps) {
+             // merged gate_up path: one mul_mat_id, then split into gate and up views
+-            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, up_exps_s, mm_ids, cached); // [n_ff*2, n_expert_used, n_tokens]
++            ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, ids, mm_ids, cached); // [n_ff*2, n_expert_used, n_tokens]
+             cb(gate_up, "ffn_moe_gate_up", il);
+ 
+-            if (up_exps_s) {
+-                cb(gate_up, "ffn_moe_gate_up_scaled", il);
+-            }
+-
+             if (gate_up_exps_b) {
+                 gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, ids);
+                 cb(gate_up, "ffn_moe_gate_up_biased", il);
+@@ -2601,29 +2545,21 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             cb(up, "ffn_moe_up", il);
+         } else {
+             // separate gate and up path
+-            up = build_lora_mm_id(up_exps, cur, ids, up_exps_s, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
++            up = build_lora_mm_id(up_exps, cur, ids, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
+             cb(up, "ffn_moe_up", il);
+ 
+-            if (up_exps_s) {
+-                cb(up, "ffn_moe_up_scaled", il);
+-            }
+-
+             if (up_exps_b) {
+                 up = ggml_add_id(ctx0, up, up_exps_b, ids);
+                 cb(up, "ffn_moe_up_biased", il);
+             }
+ 
+             if (gate_exps) {
+-                cur = build_lora_mm_id(gate_exps, cur, ids, gate_exps_s, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
++                cur = build_lora_mm_id(gate_exps, cur, ids, mm_ids, cached); // [n_ff, n_expert_used, n_tokens]
+                 cb(cur, "ffn_moe_gate", il);
+             } else {
+                 cur = up;
+             }
+ 
+-            if (gate_exps_s) {
+-                cb(cur, "ffn_moe_gate_scaled", il);
+-            }
+-
+             if (gate_exps_b) {
+                 cur = ggml_add_id(ctx0, cur, gate_exps_b, ids);
+                 cb(cur, "ffn_moe_gate_biased", il);
+@@ -2726,7 +2662,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             cur = amax_src1.res;
+         }
+ 
+-        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, down_exps_s, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
++        ggml_tensor * experts = build_lora_mm_id(down_exps, cur, ids, mm_ids, cached); // [n_embd, n_expert_used, n_tokens]
+         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
+         cb(experts, "ffn_moe_down", il);
+ 
+@@ -2744,10 +2680,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+                     return (*static_cast<decltype(build_experts) *>(user_data))(cur, ids, mm_ids, cached);
+                 }, &build_experts);
+ 
+-    if (down_exps_s) {
+-        cb(experts, "ffn_moe_down_scaled", il);
+-    }
+-
+     if (down_exps_b) {
+         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
+         cb(experts, "ffn_moe_down_biased", il);
+@@ -3484,8 +3416,6 @@ ggml_tensor * llm_graph_context::build_attn(
+         ggml_tensor * v_mla, // TODO: remove
+             float     kq_scale,
+             int       il) const {
+-    const llm_arch arch = model.arch;
+-
+     GGML_ASSERT(v_mla == nullptr);
+ 
+     if (inp->self_k_rot[il]) {
+@@ -3542,16 +3472,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     }
+ 
+     if (wo) {
+-        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
+-            // GLM4, GLM4_MOE, and JAIS2 have numerical issues with F16 accumulators
+-            cur = build_lora_mm(wo, cur);
+-            ggml_prec_set_acc(cur, GGML_PREC_BF16);
+-            if (wo_s) {
+-                cur = ggml_mul(ctx0, cur, wo_s);
+-            }
+-        } else {
+-            cur = build_lora_mm(wo, cur, wo_s);
+-        }
++        cur = build_lora_mm(wo, cur, wo_s);
+     }
+ 
+     if (wo_b) {
+@@ -3602,8 +3523,6 @@ ggml_tensor * llm_graph_context::build_attn(
+         ggml_tensor * v_mla,
+             float     kq_scale,
+             int       il) const {
+-    const llm_arch arch = model.arch;
+-
+     // these nodes are added to the graph together so that they are not reordered
+     // by doing so, the number of splits in the graph is reduced
+     // expand k later to enable rope fusion which directly writes into k-v cache
+@@ -3631,16 +3550,7 @@ ggml_tensor * llm_graph_context::build_attn(
+     cb(cur, "kqv_out", il);
+ 
+     if (wo) {
+-        if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE) {
+-            // GLM4 and GLM4_MOE have numerical issues with F16 accumulators
+-            cur = build_lora_mm(wo, cur);
+-            ggml_prec_set_acc(cur, GGML_PREC_BF16);
+-            if (wo_s) {
+-                cur = ggml_mul(ctx0, cur, wo_s);
+-            }
+-        } else {
+-            cur = build_lora_mm(wo, cur, wo_s);
+-        }
++        cur = build_lora_mm(wo, cur, wo_s);
+     }
+ 
+     if (wo_b) {
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index b5956ead9..13a9c8c5a 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1180,6 +1180,7 @@ struct llm_graph_context {
+               ggml_tensor * cur) const;
+ 
+     // do mat_mul, while optionally apply lora and per-tensor scale
++    // w_s defaults to the weight scale of w
+     ggml_tensor * build_lora_mm(
+               ggml_tensor * w,
+               ggml_tensor * cur,
+@@ -1191,7 +1192,6 @@ struct llm_graph_context {
+               ggml_tensor * w,   // ggml_tensor * as
+               ggml_tensor * cur, // ggml_tensor * b
+               ggml_tensor * ids,
+-              ggml_tensor * w_s    = nullptr,
+               ggml_tensor * slots  = nullptr,
+                      bool   cached = true) const;
+ 
+@@ -1264,9 +1264,6 @@ struct llm_graph_context {
+                      int   il,
+              ggml_tensor * probs_in = nullptr,
+              ggml_tensor * gate_up_exps = nullptr,
+-             ggml_tensor * up_exps_s = nullptr,
+-             ggml_tensor * gate_exps_s = nullptr,
+-             ggml_tensor * down_exps_s = nullptr,
+              ggml_tensor * selected_experts_in = nullptr,
+              ggml_tensor * post_exp_norm = nullptr,
+                    float   post_exp_norm_eps = 1e-5f) const;
+@@ -1292,9 +1289,6 @@ struct llm_graph_context {
+              ggml_tensor * probs_in = nullptr,
+              ggml_tensor * gate_up_exps = nullptr,
+              ggml_tensor * gate_up_exps_b = nullptr,
+-             ggml_tensor * up_exps_s = nullptr,
+-             ggml_tensor * gate_exps_s = nullptr,
+-             ggml_tensor * down_exps_s = nullptr,
+              ggml_tensor * selected_experts_in = nullptr,
+              ggml_tensor * post_exp_norm = nullptr,
+                    float   post_exp_norm_eps = 1e-5f) const;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 4c77f6f68..d362c1d23 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1408,12 +1408,19 @@ bool llama_prec_policy::apply(ggml_tensor * res) const {
+         return false;
+     }
+ 
+-    const auto it = prec_src1.find(res->src[0]);
+-    if (it == prec_src1.end()) {
+-        return false;
++    bool applied = false;
++
++    const auto it_acc = prec_acc.find(res->src[0]);
++    if (it_acc != prec_acc.end()) {
++        applied |= ggml_prec_set_acc(res, it_acc->second);
+     }
+ 
+-    return ggml_prec_set_src(res, it->second, 1);
++    const auto it_src1 = prec_src1.find(res->src[0]);
++    if (it_src1 != prec_src1.end()) {
++        applied |= ggml_prec_set_src(res, it_src1->second, 1);
++    }
++
++    return applied;
+ }
+ 
+ void llama_prec_policy::load(llama_model_loader & ml, const llama_model & model) {
+@@ -2041,6 +2048,42 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+         }
+     }
+ 
++    // map each weight to its "<name>.scale" tensor: shape {1} for a 2D weight, {n_expert} for a 3D weight
++    {
++        auto ends_with = [](const std::string & str, const std::string & suffix) {
++            return str.size() >= suffix.size() && str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
++        };
++        std::unordered_map<std::string, ggml_tensor *> weights;
++        for (const auto & [name, cur] : tensors_by_name) {
++            if (ends_with(name, ".weight")) {
++                weights.emplace(name.substr(0, name.size() - 7), cur);
++            }
++        }
++        for (const auto & [name, s] : tensors_by_name) {
++            if (!ends_with(name, ".scale")) {
++                continue;
++            }
++            const auto it = weights.find(name.substr(0, name.size() - 6));
++            if (it == weights.end()) {
++                continue;
++            }
++            ggml_tensor * w = it->second;
++            const bool ok = w->ne[3] == 1 && ggml_nelements(s) == w->ne[2] && s->ne[0] == w->ne[2];
++            if (ok) {
++                w_scales.emplace(w, s);
++            } else {
++                LLAMA_LOG_DEBUG("%s: '%s' is not a weight scale for '%s', skipping\n", __func__, name.c_str(), w->name);
++            }
++        }
++    }
++
++    // the reference computes the router in F32: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/model.py#L565
++    if (hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS || hparams.expert_router_f32) {
++        for (const auto & layer : layers) {
++            prec_policy.set_acc(layer.ffn_gate_inp, GGML_PREC_F32);
++        }
++    }
++
+     // per-tensor activation precision policy
+     prec_policy.load(ml, *this);
+ 
+@@ -2572,6 +2615,11 @@ size_t llama_model::size() const {
+     return pimpl->n_bytes;
+ }
+ 
++ggml_tensor * llama_model::get_w_scale(const ggml_tensor * w) const {
++    const auto it = w_scales.find(w);
++    return it == w_scales.end() ? nullptr : it->second;
++}
++
+ size_t llama_model::n_tensors() const {
+     return tensors_by_name.size();
+ }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index e86e5e54f..ee1b9661a 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -737,8 +737,7 @@ struct llama_meta_device_get_split_state_userdata {
+ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
+ 
+ struct llama_prec_policy {
+-    // the key is the weight tensor `res->src[0]`, stores the recommended accumulation type of the op (unused for now)
+-    // TODO: migrate ad-hoc ggml_prec_set_acc() calls to this container + update apply() to use it
++    // the key is the weight tensor `res->src[0]`, stores the recommended accumulation type of the op
+     std::unordered_map<const ggml_tensor *, ggml_prec> prec_acc;
+ 
+     // the key is the weight tensor `res->src[0]`, stores the recommended activation precision type
+@@ -746,6 +745,12 @@ struct llama_prec_policy {
+ 
+     bool apply(ggml_tensor * res) const;
+ 
++    void set_acc(const ggml_tensor * w, ggml_prec prec) {
++        if (w) {
++            prec_acc[w] = prec;
++        }
++    }
++
+     void load(llama_model_loader & ml, const llama_model & model);
+ };
+ 
+@@ -818,6 +823,11 @@ struct llama_model {
+ 
+     llama_hadamard hdmd;
+ 
++    // weight -> "<name>.scale" tensor (e.g. NVFP4 scale2), applied by build_lora_mm and build_lora_mm_id
++    std::unordered_map<const ggml_tensor *, ggml_tensor *> w_scales;
++
++    ggml_tensor * get_w_scale(const ggml_tensor * w) const;
++
+     // see llama_model_set_attn_rot
+     bool attn_rot = true;
+ 
+diff --git a/src/models/clover-moe.cpp b/src/models/clover-moe.cpp
+index 8892521ee..837997261 100644
+--- a/src/models/clover-moe.cpp
++++ b/src/models/clover-moe.cpp
+@@ -398,10 +398,7 @@ ggml_tensor * llama_model_clover_moe::graph::build_layer_ffn(ggml_tensor * cur,
+             LLM_FFN_SILU, true,
+             hparams.expert_weights_scale,
+             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+-            nullptr, model.layers[il].ffn_gate_up_exps,
+-            model.layers[il].ffn_up_exps_s,
+-            model.layers[il].ffn_gate_exps_s,
+-            model.layers[il].ffn_down_exps_s);
++            nullptr, model.layers[il].ffn_gate_up_exps);
+     cb(moe_out, "ffn_moe_out", il);
+ 
+     if (model.layers[il].ffn_up_shexp != nullptr) {
+diff --git a/src/models/cohere2moe.cpp b/src/models/cohere2moe.cpp
+index 52b959672..c4d778e50 100644
+--- a/src/models/cohere2moe.cpp
++++ b/src/models/cohere2moe.cpp
+@@ -226,10 +226,7 @@ llama_model_cohere2moe::graph::graph(const llm_graph_params & params) : llm_grap
+                     hparams.expert_weights_scale,
+                     (llama_expert_gating_func_type) hparams.expert_gating_func,
+                     il,
+-                    nullptr, layer.ffn_gate_up_exps,
+-                    layer.ffn_up_exps_s,
+-                    layer.ffn_gate_exps_s,
+-                    layer.ffn_down_exps_s);
++                    nullptr, layer.ffn_gate_up_exps);
+             cb(cur, "ffn_moe_out", il);
+ 
+             if (layer.ffn_up_shexp) {
+@@ -371,10 +368,7 @@ llama_model_cohere2moe::graph_mtp::graph_mtp(const llm_graph_params & params) :
+             hparams.expert_weights_scale,
+             (llama_expert_gating_func_type) hparams.expert_gating_func,
+             il,
+-            nullptr, layer.ffn_gate_up_exps,
+-            layer.ffn_up_exps_s,
+-            layer.ffn_gate_exps_s,
+-            layer.ffn_down_exps_s);
++            nullptr, layer.ffn_gate_up_exps);
+     cb(cur, "mtp_ffn_moe_out", il);
+ 
+     if (layer.ffn_up_shexp) {
+diff --git a/src/models/deepseek32.cpp b/src/models/deepseek32.cpp
+index fc6207f8b..9fb9c2004 100644
+--- a/src/models/deepseek32.cpp
++++ b/src/models/deepseek32.cpp
+@@ -421,10 +421,7 @@ llama_model_deepseek32::graph::graph(const llm_graph_params & params) :
+                 (llama_expert_gating_func_type) hparams.expert_gating_func,
+                 il,
+                 nullptr,
+-                model.layers[il].ffn_gate_up_exps,
+-                model.layers[il].ffn_up_exps_s,
+-                model.layers[il].ffn_gate_exps_s,
+-                model.layers[il].ffn_down_exps_s);
++                model.layers[il].ffn_gate_up_exps);
+             cb(moe_out, "ffn_moe_out", il);
+ 
+             // FFN shared expert
+@@ -662,10 +659,7 @@ llama_model_deepseek32::graph_mtp::graph_mtp(const llm_graph_params & params)
+         (llama_expert_gating_func_type) hparams.expert_gating_func,
+         il,
+         nullptr,
+-        layer.ffn_gate_up_exps,
+-        layer.ffn_up_exps_s,
+-        layer.ffn_gate_exps_s,
+-        layer.ffn_down_exps_s);
++        layer.ffn_gate_up_exps);
+     cb(moe_out, "mtp_ffn_moe_out", il);
+ 
+     // FFN shared expert
+diff --git a/src/models/deepseek4.cpp b/src/models/deepseek4.cpp
+index 69ebe5a60..1d765729e 100644
+--- a/src/models/deepseek4.cpp
++++ b/src/models/deepseek4.cpp
+@@ -1308,9 +1308,6 @@ llama_model_deepseek4::graph::graph(const llm_graph_params & params) :
+                 il,
+                 nullptr,
+                 nullptr,
+-                nullptr,
+-                nullptr,
+-                nullptr,
+                 selected_experts);
+         cb(moe_out, "ffn_moe_out", il);
+ 
+diff --git a/src/models/deepseek41.cpp b/src/models/deepseek41.cpp
+index 96de90412..b619decb9 100644
+--- a/src/models/deepseek41.cpp
++++ b/src/models/deepseek41.cpp
+@@ -203,6 +203,8 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
+         }
+ 
+         layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
++        // the reference computes the router in F32: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/1bae0e1088993b9b82de08f59de5be5a34e42170/inference/model.py#L813
++        prec_policy.set_acc(layer.ffn_gate_inp, GGML_PREC_F32);
+         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, 0);
+         layer.ffn_exp_probs_b_vl = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
+         layer.ffn_norm        = create_tensor(tn(LLM_TENSOR_FFN_NORM,        "weight", i), {n_embd}, 0);
+@@ -875,9 +877,7 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
+         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+         cb(cur, "ffn_norm", il);
+ 
+-        // the reference computes the router in F32: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/1bae0e1088993b9b82de08f59de5be5a34e42170/inference/model.py#L813
+         ggml_tensor * logits = build_lora_mm(layer.ffn_gate_inp, cur);
+-        ggml_prec_set_acc(logits, GGML_PREC_F32);
+         cb(logits, "ffn_moe_logits", il);
+ 
+         // image (embedding) tokens use the vision router bias, as DeepSeek-V4
+diff --git a/src/models/dots3note.cpp b/src/models/dots3note.cpp
+index a6fccd58f..97955f456 100644
+--- a/src/models/dots3note.cpp
++++ b/src/models/dots3note.cpp
+@@ -435,10 +435,7 @@ llama_model_dots3note::graph::graph(const llm_graph_params & params) :
+                 (llama_expert_gating_func_type) hparams.expert_gating_func,
+                 il,
+                 nullptr,
+-                model.layers[il].ffn_gate_up_exps,
+-                model.layers[il].ffn_up_exps_s,
+-                model.layers[il].ffn_gate_exps_s,
+-                model.layers[il].ffn_down_exps_s);
++                model.layers[il].ffn_gate_up_exps);
+             cb(moe_out, "ffn_moe_out", il);
+ 
+             ggml_tensor * ffn_shexp =
+diff --git a/src/models/flint.cpp b/src/models/flint.cpp
+index 520334ce6..173278b6f 100644
+--- a/src/models/flint.cpp
++++ b/src/models/flint.cpp
+@@ -158,10 +158,7 @@ llama_model_flint::graph::graph(const llm_graph_params & params) :
+                 LLM_FFN_SILU, hparams.expert_weights_norm,
+                 hparams.expert_weights_scale,
+                 (llama_expert_gating_func_type) hparams.expert_gating_func,
+-                il, nullptr, nullptr,
+-                model.layers[il].ffn_up_exps_s,
+-                model.layers[il].ffn_gate_exps_s,
+-                model.layers[il].ffn_down_exps_s);
++                il);
+             cb(moe_out, "ffn_moe_out", il);
+ 
+             {
+diff --git a/src/models/gemma4.cpp b/src/models/gemma4.cpp
+index 1a377fa3c..491ef1283 100644
+--- a/src/models/gemma4.cpp
++++ b/src/models/gemma4.cpp
+@@ -406,10 +406,7 @@ llama_model_gemma4::graph::graph(const llm_graph_params & params) :
+                     1.0f,
+                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                     il, logits,
+-                    model.layers[il].ffn_gate_up_exps,
+-                    model.layers[il].ffn_up_exps_s,
+-                    model.layers[il].ffn_gate_exps_s,
+-                    model.layers[il].ffn_down_exps_s);
++                    model.layers[il].ffn_gate_up_exps);
+             cur_moe = build_norm(cur_moe,
+                     model.layers[il].ffn_post_norm_2, nullptr,
+                     LLM_NORM_RMS, il);
+diff --git a/src/models/glm-dsa.cpp b/src/models/glm-dsa.cpp
+index 7007f427f..421927d80 100644
+--- a/src/models/glm-dsa.cpp
++++ b/src/models/glm-dsa.cpp
+@@ -469,10 +469,7 @@ llama_model_glm_dsa::graph::graph(const llm_graph_params & params) :
+                 (llama_expert_gating_func_type) hparams.expert_gating_func,
+                 il,
+                 nullptr,
+-                model.layers[il].ffn_gate_up_exps,
+-                model.layers[il].ffn_up_exps_s,
+-                model.layers[il].ffn_gate_exps_s,
+-                model.layers[il].ffn_down_exps_s);
++                model.layers[il].ffn_gate_up_exps);
+             cb(moe_out, "ffn_moe_out", il);
+ 
+             // FFN shared expert
+@@ -710,10 +707,7 @@ llama_model_glm_dsa::graph_mtp::graph_mtp(const llm_graph_params & params)
+         (llama_expert_gating_func_type) hparams.expert_gating_func,
+         il,
+         nullptr,
+-        layer.ffn_gate_up_exps,
+-        layer.ffn_up_exps_s,
+-        layer.ffn_gate_exps_s,
+-        layer.ffn_down_exps_s);
++        layer.ffn_gate_up_exps);
+     cb(moe_out, "mtp_ffn_moe_out", il);
+ 
+     // FFN shared expert
+diff --git a/src/models/glm4-moe.cpp b/src/models/glm4-moe.cpp
+index 9560fd3d0..a3e2fa46e 100644
+--- a/src/models/glm4-moe.cpp
++++ b/src/models/glm4-moe.cpp
+@@ -113,6 +113,11 @@ void llama_model_glm4_moe::load_arch_tensors(llama_model_loader & ml) {
+             layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED | flags);
+             layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), { n_embd }, TENSOR_NOT_REQUIRED | flags);
+         }
++
++        // numerical issues with F16 accumulators
++        prec_policy.set_acc(layer.wo,             GGML_PREC_BF16);
++        prec_policy.set_acc(layer.ffn_down,       GGML_PREC_BF16);
++        prec_policy.set_acc(layer.ffn_down_shexp, GGML_PREC_BF16);
+     }
+ }
+ 
+diff --git a/src/models/glm4.cpp b/src/models/glm4.cpp
+index e57c51cbe..5c50b2f05 100644
+--- a/src/models/glm4.cpp
++++ b/src/models/glm4.cpp
+@@ -58,6 +58,10 @@ void llama_model_glm4::load_arch_tensors(llama_model_loader &) {
+             layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", i), { n_embd, n_vocab }, flags | TENSOR_NOT_REQUIRED);
+             layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", i), { n_embd }, flags | TENSOR_NOT_REQUIRED);
+         }
++
++        // numerical issues with F16 accumulators
++        prec_policy.set_acc(layer.wo,       GGML_PREC_BF16);
++        prec_policy.set_acc(layer.ffn_down, GGML_PREC_BF16);
+     }
+ }
+ 
+diff --git a/src/models/granite-hybrid.cpp b/src/models/granite-hybrid.cpp
+index be352dfd7..d638663af 100644
+--- a/src/models/granite-hybrid.cpp
++++ b/src/models/granite-hybrid.cpp
+@@ -260,11 +260,7 @@ ggml_tensor * llama_model_granite_hybrid::graph::build_layer_ffn(ggml_tensor *
+                 LLM_FFN_SILU, true,
+                 hparams.expert_weights_scale,
+                 LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+-                il,
+-                nullptr, nullptr,
+-                model.layers[il].ffn_up_exps_s,
+-                model.layers[il].ffn_gate_exps_s,
+-                model.layers[il].ffn_down_exps_s);
++                il);
+         cb(moe_out, "ffn_moe_out", il);
+ 
+         // For Granite MoE Shared
+diff --git a/src/models/granite-swa.cpp b/src/models/granite-swa.cpp
+index be9e55778..2e2609f52 100644
+--- a/src/models/granite-swa.cpp
++++ b/src/models/granite-swa.cpp
+@@ -277,10 +277,7 @@ ggml_tensor * llama_model_granite_swa::graph::build_layer_ffn(
+                 hparams.expert_weights_scale,
+                 LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+                 il,
+-                nullptr, model.layers[il].ffn_gate_up_exps,
+-                model.layers[il].ffn_up_exps_s,
+-                model.layers[il].ffn_gate_exps_s,
+-                model.layers[il].ffn_down_exps_s);
++                nullptr, model.layers[il].ffn_gate_up_exps);
+         cb(moe_out, "ffn_moe_out", il);
+ 
+         // For Granite MoE Shared - gate+up kept fused in ffn_up_shexp
+diff --git a/src/models/granite.cpp b/src/models/granite.cpp
+index 0ab9084da..0a5dd78ea 100644
+--- a/src/models/granite.cpp
++++ b/src/models/granite.cpp
+@@ -269,11 +269,7 @@ ggml_tensor * llama_model_granite::graph::build_layer_ffn(
+                 LLM_FFN_SILU, true,
+                 hparams.expert_weights_scale,
+                 LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+-                il,
+-                nullptr, nullptr,
+-                model.layers[il].ffn_up_exps_s,
+-                model.layers[il].ffn_gate_exps_s,
+-                model.layers[il].ffn_down_exps_s);
++                il);
+         cb(moe_out, "ffn_moe_out", il);
+ 
+         // For Granite MoE Shared
+diff --git a/src/models/hy-v3.cpp b/src/models/hy-v3.cpp
+index c47c373f8..f53d94827 100644
+--- a/src/models/hy-v3.cpp
++++ b/src/models/hy-v3.cpp
+@@ -168,10 +168,7 @@ llama_model_hy_v3::graph::graph(const llm_graph_params & params) : llm_graph_con
+                     hparams.expert_weights_scale,
+                     (llama_expert_gating_func_type) hparams.expert_gating_func,
+                     il,
+-                    nullptr, model.layers[il].ffn_gate_up_exps,
+-                    model.layers[il].ffn_up_exps_s,
+-                    model.layers[il].ffn_gate_exps_s,
+-                    model.layers[il].ffn_down_exps_s);
++                    nullptr, model.layers[il].ffn_gate_up_exps);
+             cb(moe_out, "ffn_moe_out", il);
+ 
+             // shared expert (always active, no gate)
+@@ -323,10 +320,7 @@ llama_model_hy_v3::graph_mtp::graph_mtp(const llm_graph_params & params)
+                 hparams.expert_weights_scale,
+                 (llama_expert_gating_func_type) hparams.expert_gating_func,
+                 il,
+-                nullptr, layer.ffn_gate_up_exps,
+-                layer.ffn_up_exps_s,
+-                layer.ffn_gate_exps_s,
+-                layer.ffn_down_exps_s);
++                nullptr, layer.ffn_gate_up_exps);
+         cb(moe_out, "mtp_ffn_moe_out", il);
+ 
+         ggml_tensor * sh_out = build_ffn(cur,
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 3e43ef418..45477a69e 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -97,6 +97,7 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
+ 
+     // output
+     output           = create_tensor(tn(LLM_TENSOR_OUTPUT,           "weight"), {n_embd, n_vocab_padded}, 0);
++    prec_policy.set_acc(output, GGML_PREC_F32);
+     output_norm      = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,      "weight"), {n_embd}, 0);
+     output_res_query = create_tensor(tn(LLM_TENSOR_OUTPUT_RES_QUERY, "weight"), {n_embd}, 0);
+ 
+@@ -406,10 +407,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+             LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
+             il,
+             nullptr,
+-            layer.ffn_gate_up_exps,
+-            layer.ffn_up_exps_s,
+-            layer.ffn_gate_exps_s,
+-            layer.ffn_down_exps_s);
++            layer.ffn_gate_up_exps);
+ 
+     cur = convolve(cur, layer.ffn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa + n_embd);
+     cb(cur, "ffn_out", il);
+@@ -433,7 +431,6 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
+ 
+     // lm_head
+     cur = build_lora_mm(model.output, cur);
+-    ggml_prec_set_acc(cur, GGML_PREC_F32);
+ 
+     if (hparams.f_final_logit_softcapping != 0.0f) {
+         const float cap = hparams.f_final_logit_softcapping;
+diff --git a/src/models/jais2.cpp b/src/models/jais2.cpp
+index 8376423ea..1f077fd86 100644
+--- a/src/models/jais2.cpp
++++ b/src/models/jais2.cpp
+@@ -42,6 +42,10 @@ void llama_model_jais2::load_arch_tensors(llama_model_loader &) {
+         layer.ffn_up_b   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "bias", i),   {n_ff}, 0);
+         layer.ffn_down   = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff, n_embd}, 0);
+         layer.ffn_down_b = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "bias", i),   {n_embd}, 0);
++
++        // numerical issues with F16 accumulators
++        prec_policy.set_acc(layer.wo,       GGML_PREC_BF16);
++        prec_policy.set_acc(layer.ffn_down, GGML_PREC_BF16);
+     }
+ }
+ 
+diff --git a/src/models/kolibri1.cpp b/src/models/kolibri1.cpp
+index c4d8eca1b..64182d186 100644
+--- a/src/models/kolibri1.cpp
++++ b/src/models/kolibri1.cpp
+@@ -142,7 +142,7 @@ llama_model_kolibri1::graph::graph(const llm_graph_params & params)
+                 (llama_expert_gating_func_type) hparams.expert_gating_func,
+                 il,
+                 logits,
+-                nullptr, nullptr, nullptr, nullptr, selected);
++                nullptr, selected);
+         cb(moe_out, "ffn_moe_out", il);
+ 
+         ggml_tensor * shared = build_ffn(cur,
+diff --git a/src/models/lfm-base.cpp b/src/models/lfm-base.cpp
+index 3627c527d..03e59bd09 100644
+--- a/src/models/lfm-base.cpp
++++ b/src/models/lfm-base.cpp
+@@ -116,10 +116,5 @@ ggml_tensor * llm_build_lfm_base::build_lfm_moe_ffn(ggml_tensor * cur,
+             LLM_FFN_SILU, true,
+             hparams.expert_weights_scale,
+             static_cast<llama_expert_gating_func_type>(hparams.expert_gating_func),
+-            il,
+-            nullptr,
+-            nullptr,
+-            model.layers[il].ffn_up_exps_s,
+-            model.layers[il].ffn_gate_exps_s,
+-            model.layers[il].ffn_down_exps_s);
++            il);
+ }
+diff --git a/src/models/llama.cpp b/src/models/llama.cpp
+index 26d54968c..3925699f4 100644
+--- a/src/models/llama.cpp
++++ b/src/models/llama.cpp
+@@ -198,11 +198,7 @@ llama_model_llama::graph<embed>::graph(const llm_graph_params & params) : llm_gr
+                     LLM_FFN_SILU, true,
+                     hparams.expert_weights_scale,
+                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+-                    il,
+-                    nullptr, nullptr,
+-                    model.layers[il].ffn_up_exps_s,
+-                    model.layers[il].ffn_gate_exps_s,
+-                    model.layers[il].ffn_down_exps_s);
++                    il);
+             cb(cur, "ffn_moe_out", il);
+         }
+         cur = ggml_add(ctx0, cur, ffn_inp);
+diff --git a/src/models/mellum.cpp b/src/models/mellum.cpp
+index 57dd5b79a..d0b3609b1 100644
+--- a/src/models/mellum.cpp
++++ b/src/models/mellum.cpp
+@@ -199,11 +199,7 @@ llama_model_mellum::graph<iswa>::graph(const llm_graph_params & params) : llm_gr
+                     LLM_FFN_SILU, hparams.expert_weights_norm,
+                     hparams.expert_weights_scale,
+                     (llama_expert_gating_func_type) hparams.expert_gating_func,
+-                    il,
+-                    nullptr, nullptr,
+-                    model.layers[il].ffn_up_exps_s,
+-                    model.layers[il].ffn_gate_exps_s,
+-                    model.layers[il].ffn_down_exps_s);
++                    il);
+         cb(moe_out, "ffn_moe_out", il);
+         cur = moe_out;
+ 
+@@ -351,11 +347,7 @@ llama_model_mellum::graph_mtp<iswa>::graph_mtp(const llm_graph_params & params)
+             LLM_FFN_SILU, hparams.expert_weights_norm,
+             hparams.expert_weights_scale,
+             (llama_expert_gating_func_type) hparams.expert_gating_func,
+-            il,
+-            nullptr, nullptr,
+-            layer.ffn_up_exps_s,
+-            layer.ffn_gate_exps_s,
+-            layer.ffn_down_exps_s);
++            il);
+     cb(cur, "mtp_ffn_moe_out", il);
+ 
+     cur = ggml_add(ctx0, cur, ffn_inp);
+diff --git a/src/models/metis16.cpp b/src/models/metis16.cpp
+index 8a433f3cc..0a57a6ab0 100644
+--- a/src/models/metis16.cpp
++++ b/src/models/metis16.cpp
+@@ -329,7 +329,7 @@ llama_model_metis16::graph::graph(const llm_graph_params & params) :
+ 
+                 ggml_tensor * moe_out = build_moe_ffn(latent, nullptr, nullptr, nullptr, layer.ffn_down_exps, nullptr,
+                         n_exp, n_used, LLM_FFN_SILU, false, 0.0f, LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT, il_p,
+-                        logits, layer.ffn_gate_up_exps, nullptr, nullptr, nullptr, selected);
++                        logits, layer.ffn_gate_up_exps, selected);
+                 ggml_tensor * shexp = build_ffn(latent,
+                         layer.ffn_up_shexp,   NULL, NULL,
+                         layer.ffn_gate_shexp, NULL, NULL,
+diff --git a/src/models/minimax-m3.cpp b/src/models/minimax-m3.cpp
+index 4f1184590..8560c710a 100644
+--- a/src/models/minimax-m3.cpp
++++ b/src/models/minimax-m3.cpp
+@@ -572,10 +572,7 @@ llama_model_minimax_m3::graph::graph(const llm_graph_params & params) : llm_grap
+                     LLM_FFN_SWIGLU_OAI_MOE, hparams.expert_weights_norm,
+                     hparams.expert_weights_scale,
+                     (llama_expert_gating_func_type) hparams.expert_gating_func,
+-                    il, nullptr, nullptr,
+-                    model.layers[il].ffn_up_exps_s,
+-                    model.layers[il].ffn_gate_exps_s,
+-                    model.layers[il].ffn_down_exps_s);
++                    il);
+             cb(moe_out, "ffn_moe_out", il);
+ 
+             // shared expert (swigluoai)
+diff --git a/src/models/mistral-large4.cpp b/src/models/mistral-large4.cpp
+index a4315a991..0facb800d 100644
+--- a/src/models/mistral-large4.cpp
++++ b/src/models/mistral-large4.cpp
+@@ -458,10 +458,7 @@ llama_model_mistral_large4::graph::graph(const llm_graph_params & params) :
+                 (llama_expert_gating_func_type) hparams.expert_gating_func,
+                 il,
+                 nullptr,
+-                layer.ffn_gate_up_exps,
+-                layer.ffn_up_exps_s,
+-                layer.ffn_gate_exps_s,
+-                layer.ffn_down_exps_s);
++                layer.ffn_gate_up_exps);
+             cb(moe_out, "ffn_moe_out", il);
+ 
+             ggml_tensor * ffn_shexp = build_ffn(cur,
+diff --git a/src/models/mistral3.cpp b/src/models/mistral3.cpp
+index ab8121863..e1e6981bb 100644
+--- a/src/models/mistral3.cpp
++++ b/src/models/mistral3.cpp
+@@ -248,11 +248,7 @@ llama_model_mistral3::graph::graph(const llm_graph_params & params) : llm_graph_
+                     LLM_FFN_SILU, true,
+                     hparams.expert_weights_scale,
+                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+-                    il,
+-                    nullptr, nullptr,
+-                    model.layers[il].ffn_up_exps_s,
+-                    model.layers[il].ffn_gate_exps_s,
+-                    model.layers[il].ffn_down_exps_s);
++                    il);
+             cb(cur, "ffn_moe_out", il);
+         }
+         cur = ggml_add(ctx0, cur, ffn_inp);
+diff --git a/src/models/muse-spark.cpp b/src/models/muse-spark.cpp
+index ea6ab84ab..10de4676e 100644
+--- a/src/models/muse-spark.cpp
++++ b/src/models/muse-spark.cpp
+@@ -180,7 +180,7 @@ llama_model_muse_spark::graph::graph(const llm_graph_params & params)
+                 (llama_expert_gating_func_type) hparams.expert_gating_func,
+                 il,
+                 router_logits,
+-                nullptr, nullptr, nullptr, nullptr, nullptr,
++                nullptr, nullptr,
+                 model.layers[il].ffn_post_exp_norm, hparams.f_post_norm_eps);
+         cb(moe_out, "ffn_moe_out", il);
+ 
+diff --git a/src/models/nemotron-h-moe.cpp b/src/models/nemotron-h-moe.cpp
+index 475355832..3aa385379 100644
+--- a/src/models/nemotron-h-moe.cpp
++++ b/src/models/nemotron-h-moe.cpp
+@@ -118,10 +118,7 @@ llama_model_nemotron_h_moe::graph_mtp::graph_mtp(const llm_graph_params & params
+                 hparams.expert_weights_scale,
+                 LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
+                 il,
+-                router_logits, nullptr,
+-                layer.ffn_up_exps_s,
+-                nullptr, // no gate
+-                layer.ffn_down_exps_s);
++                router_logits);
+         cb(moe_out, "mtp_ffn_moe_out", il);
+ 
+         if (layer.ffn_latent_up) {
+diff --git a/src/models/nemotron-h.cpp b/src/models/nemotron-h.cpp
+index 313f42f1c..18e45320a 100644
+--- a/src/models/nemotron-h.cpp
++++ b/src/models/nemotron-h.cpp
+@@ -322,10 +322,7 @@ ggml_tensor * llama_model_nemotron_h::graph::build_ffn_layer(ggml_tensor * cur,
+                     hparams.expert_weights_scale,
+                     LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID,
+                     il,
+-                    router_logits, nullptr,
+-                    model.layers[il].ffn_up_exps_s,
+-                    nullptr, // no gate
+-                    model.layers[il].ffn_down_exps_s);
++                    router_logits);
+         cb(moe_out, "ffn_moe_out", il);
+ 
+         if (model.layers[il].ffn_latent_up) {
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index c0ee6fa03..c92b84d9d 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -479,10 +479,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+             LLM_FFN_SILU, true,
+             hparams.expert_weights_scale,
+             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+-            nullptr, model.layers[il].ffn_gate_up_exps,
+-            model.layers[il].ffn_up_exps_s,
+-            model.layers[il].ffn_gate_exps_s,
+-            model.layers[il].ffn_down_exps_s);
++            nullptr, model.layers[il].ffn_gate_up_exps);
+     cb(moe_out, "ffn_moe_out", il);
+ 
+     // Add shared experts if present - following Qwen3Next reference implementation
+@@ -651,10 +648,7 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
+             LLM_FFN_SILU, true,
+             hparams.expert_weights_scale,
+             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+-            nullptr, layer.ffn_gate_up_exps,
+-            layer.ffn_up_exps_s,
+-            layer.ffn_gate_exps_s,
+-            layer.ffn_down_exps_s);
++            nullptr, layer.ffn_gate_up_exps);
+     cb(moe_out, "mtp_ffn_moe_out", il);
+ 
+     if (layer.ffn_up_shexp != nullptr) {
+diff --git a/src/models/qwen3moe.cpp b/src/models/qwen3moe.cpp
+index ce7144a22..fc57928f5 100644
+--- a/src/models/qwen3moe.cpp
++++ b/src/models/qwen3moe.cpp
+@@ -136,11 +136,7 @@ llama_model_qwen3moe::graph::graph(const llm_graph_params & params) : llm_graph_
+                     LLM_FFN_SILU, true,
+                     hparams.expert_weights_scale,
+                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
+-                    il,
+-                    nullptr, nullptr,
+-                    model.layers[il].ffn_up_exps_s,
+-                    model.layers[il].ffn_gate_exps_s,
+-                    model.layers[il].ffn_down_exps_s);
++                    il);
+         cb(moe_out, "ffn_moe_out", il);
+         cur = moe_out;
+ 
+diff --git a/src/models/qwen3next.cpp b/src/models/qwen3next.cpp
+index 9546fba58..208aa49d2 100644
+--- a/src/models/qwen3next.cpp
++++ b/src/models/qwen3next.cpp
+@@ -561,10 +561,7 @@ ggml_tensor * llama_model_qwen3next::graph::build_layer_ffn(ggml_tensor * cur, c
+                 LLM_FFN_SILU, true,
+                 hparams.expert_weights_scale,
+                 LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+-                nullptr, model.layers[il].ffn_gate_up_exps,
+-                model.layers[il].ffn_up_exps_s,
+-                model.layers[il].ffn_gate_exps_s,
+-                model.layers[il].ffn_down_exps_s);
++                nullptr, model.layers[il].ffn_gate_up_exps);
+         cb(moe_out, "ffn_moe_out", il);
+ 
+         // Add shared experts if present - following Qwen3Next reference implementation
+@@ -748,10 +745,7 @@ llama_model_qwen3next::graph_mtp::graph_mtp(const llm_graph_params & params)
+             LLM_FFN_SILU, true,
+             hparams.expert_weights_scale,
+             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+-            nullptr, layer.ffn_gate_up_exps,
+-            layer.ffn_up_exps_s,
+-            layer.ffn_gate_exps_s,
+-            layer.ffn_down_exps_s);
++            nullptr, layer.ffn_gate_up_exps);
+     cb(moe_out, "mtp_ffn_moe_out", il);
+ 
+     if (layer.ffn_up_shexp != nullptr) {
+diff --git a/src/models/qwen4exp.cpp b/src/models/qwen4exp.cpp
+index 7bf9b3fee..46bfcea07 100644
+--- a/src/models/qwen4exp.cpp
++++ b/src/models/qwen4exp.cpp
+@@ -1231,10 +1231,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
+             LLM_FFN_SILU, true,
+             hparams.expert_weights_scale,
+             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+-            nullptr, model.layers[il].ffn_gate_up_exps,
+-            model.layers[il].ffn_up_exps_s,
+-            model.layers[il].ffn_gate_exps_s,
+-            model.layers[il].ffn_down_exps_s);
++            nullptr, model.layers[il].ffn_gate_up_exps);
+     cb(moe_out, "ffn_moe_out", il);
+ 
+     // shared experts, as in the Qwen3Next reference
+diff --git a/src/models/zaya1.cpp b/src/models/zaya1.cpp
+index 2763500f4..013658c73 100644
+--- a/src/models/zaya1.cpp
++++ b/src/models/zaya1.cpp
+@@ -277,9 +277,6 @@ ggml_tensor * llama_model_zaya1::graph::build_router_moe(const llama_model & mod
+             il,
+             logits,
+             layer.ffn_gate_up_exps,
+-            nullptr,
+-            nullptr,
+-            nullptr,
+             expert);
+ 
+     return ggml_mul(ctx0, moe, keep);
+diff --git a/tests/fusion/MTL.csv b/tests/fusion/MTL.csv
+index b939d6683..bd81aa3f5 100644
+--- a/tests/fusion/MTL.csv
++++ b/tests/fusion/MTL.csv
+@@ -41,6 +41,7 @@ cohere2             ,0   ,any     ,NORM+MUL                    ,      3
+ cohere2moe          ,1   ,any     ,ADD+ADD                     ,      2
+ cohere2moe          ,1   ,any     ,MUL+ADD                     ,      2
+ cohere2moe          ,1   ,any     ,RMS_NORM+MUL                ,      3
++command-r           ,0   ,any     ,ADD+ADD                     ,      2
+ command-r           ,0   ,any     ,NORM+MUL                    ,      3
+ dbrx                ,0   ,any     ,MUL+ADD                     ,      4
+ dbrx                ,0   ,any     ,NORM+MUL                    ,      5
+@@ -207,6 +208,7 @@ llama               ,0   ,any     ,MUL+ADD                     ,      4
+ llama               ,0   ,any     ,RMS_NORM+MUL                ,      5
+ llama               ,0   ,any     ,SOFT_MAX+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
+ llama4              ,0   ,any     ,ADD+ADD                     ,      2
++llama4              ,0   ,any     ,MUL+ADD                     ,      4
+ llama4              ,0   ,any     ,RMS_NORM+MUL                ,      9
+ maincoder           ,0   ,any     ,RMS_NORM+MUL                ,      9
+ maion-coder         ,0   ,any     ,MUL+ADD                     ,      4
+@@ -256,8 +258,7 @@ mistral4            ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS  ,      1
+ mpt                 ,0   ,any     ,NORM+MUL+ADD                ,      5
+ muse-glimmer        ,0   ,any     ,RMS_NORM+MUL                ,     10
+ muse-glimmer        ,0   ,any     ,RMS_NORM+MUL+ADD            ,      3
+-muse-spark          ,0   ,prefill ,MUL+ADD                     ,      2
+-muse-spark          ,0   ,decode  ,MUL+ADD                     ,      4
++muse-spark          ,0   ,any     ,MUL+ADD                     ,      4
+ muse-spark          ,0   ,any     ,RMS_NORM+MUL                ,     11
+ muse-spark          ,0   ,any     ,RMS_NORM+MUL+ADD            ,      3
+ muse-spark          ,0   ,any     ,UNARY+ADD+ARGSORT+GET_ROWS+SUM_ROWS+CLAMP+DIV,      2
+-- 
+2.46.2.windows.1
+
+
+From cacd23636127ad4384577ac7945498e02685c776 Mon Sep 17 00:00:00 2001
+From: Daniel Han <danielhanchen@gmail.com>
+Date: Sat, 21 Nov 2026 03:10:38 -0800
+Subject: [PATCH 2/2] model : inkling2_loop share the loop slots after the
+ scale pass (#32704)
+
+The loop slots copied the physical layers at the end of load_arch_tensors,
+before the generic pass attaches the optional .scale tensors, so the later
+passes through the core ran NVFP4 experts without their per-expert scales.
+Add an optional post_arch_tensors hook that runs after the scale pass and
+share the slots there.
+---
+ src/llama-model.cpp          | 1 +
+ src/llama-model.h            | 3 +++
+ src/models/inkling2-loop.cpp | 2 ++
+ src/models/models.h          | 1 +
+ 4 files changed, 7 insertions(+)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index d362c1d23..d425e298d 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2026,6 +2026,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+                 output_in_s = create_tensor(tn(LLM_TENSOR_OUTPUT, "input_scale"), {1}, TENSOR_NOT_REQUIRED);
+             }
+         }
++        post_arch_tensors(ml);
+     }
+ 
+     ml.done_getting_tensors();
+diff --git a/src/llama-model.h b/src/llama-model.h
+index ee1b9661a..eae5c6848 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -1080,6 +1080,9 @@ struct llama_model {
+     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
+     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
+ 
++    // optional, runs after the scale pass
++    virtual void post_arch_tensors(llama_model_loader &) {}
++
+ protected:
+     llama_model_params params;
+ 
+diff --git a/src/models/inkling2-loop.cpp b/src/models/inkling2-loop.cpp
+index 0de66baee..8366a1191 100644
+--- a/src/models/inkling2-loop.cpp
++++ b/src/models/inkling2-loop.cpp
+@@ -60,7 +60,9 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
+             l.ctrl_forget[c] = create_tensor(tn(forget[c], "weight", il), {rank, n_embd}, 0);
+         }
+     }
++}
+ 
++void llama_model_inkling2_loop::post_arch_tensors(llama_model_loader &) {
+     // share the physical weights, each cache slot keeps its own KV and conv state
+     for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
+         layers[il] = layers[layer_phys(il)];
+diff --git a/src/models/models.h b/src/models/models.h
+index 636afeae9..8d2a58827 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2547,6 +2547,7 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
+     llama_model_inkling2_loop(const struct llama_model_params & params) : llama_model_inkling2(params) {}
+     void load_arch_hparams(llama_model_loader & ml) override;
+     void load_arch_tensors(llama_model_loader & ml) override;
++    void post_arch_tensors(llama_model_loader & ml) override;
+ 
+     int n_layer_phys() const override { return n_phys; }
+     int layer_phys(int il) const;
+-- 
+2.46.2.windows.1
+

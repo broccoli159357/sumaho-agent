@@ -1,0 +1,95 @@
+diff --git a/core/src/moe/router_hook.cpp b/core/src/moe/router_hook.cpp
+index d43586f..cf94e95 100644
+--- a/core/src/moe/router_hook.cpp
++++ b/core/src/moe/router_hook.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ 
+@@ -1168,8 +1169,81 @@ void RouterHook::flush_pending() {
+     P.nu = P.nt = 0;
+ }
+ 
++// 調査用: 環境変数 BMOE_NODESTATS=<ファイル> のとき、全ノードを1つずつ区切って計算し、出力の要約
++// (合計・絶対値合計・最大絶対値・L2・NaN/Inf・入力元) を1行ずつ書く。グラフごとに "#graph" 行で区切る。
++// 本来のフックが見たいノードにだけ本来の処理を渡すので、エンジンの動作は変えない（区切りが増えるだけ）。
++namespace {
++FILE * g_ns_out = nullptr;
++bool g_ns_init = false;
++bool g_ns_inner_want = false;
++long g_ns_idx = 0;
++long g_ns_graph = 0;
++std::vector<uint8_t> g_ns_buf;
++
++float ns_read(const uint8_t * p, ggml_type t) {
++    switch (t) {
++        case GGML_TYPE_F32: return *(const float *) p;
++        case GGML_TYPE_F16: return ggml_fp16_to_fp32(*(const ggml_fp16_t *) p);
++        case GGML_TYPE_BF16: return ggml_bf16_to_fp32(*(const ggml_bf16_t *) p);
++        case GGML_TYPE_I32: return (float) *(const int32_t *) p;
++        default: return 0.0f;
++    }
++}
++
++void ns_dump(const ggml_tensor * t, bool device_placed) {
++    if (std::strcmp(t->name, "embd") == 0) {
++        std::fprintf(g_ns_out, "#graph %ld dev=%d ntok=%lld\n", g_ns_graph++, device_placed ? 1 : 0,
++                     (long long) t->ne[1]);
++        g_ns_idx = 0;
++    }
++    const ggml_type ty = t->type;
++    const bool readable = ty == GGML_TYPE_F32 || ty == GGML_TYPE_F16 || ty == GGML_TYPE_BF16 || ty == GGML_TYPE_I32;
++    double sum = 0, sabs = 0, mabs = 0, ssq = 0;
++    long nan = 0, inf = 0, n = 0;
++    if (readable && t->buffer && t->data) {
++        const uint8_t * data;
++        if (ggml_backend_buffer_is_host(t->buffer)) {
++            data = (const uint8_t *) t->data;
++        } else {
++            g_ns_buf.resize(ggml_nbytes(t));
++            ggml_backend_tensor_get(t, g_ns_buf.data(), 0, ggml_nbytes(t));
++            data = g_ns_buf.data();
++        }
++        for (int64_t i3 = 0; i3 < t->ne[3]; i3++)
++            for (int64_t i2 = 0; i2 < t->ne[2]; i2++)
++                for (int64_t i1 = 0; i1 < t->ne[1]; i1++)
++                    for (int64_t i0 = 0; i0 < t->ne[0]; i0++) {
++                        const float v = ns_read(data + i3 * t->nb[3] + i2 * t->nb[2] + i1 * t->nb[1] + i0 * t->nb[0], ty);
++                        if (std::isnan(v)) { nan++; continue; }
++                        if (std::isinf(v)) { inf++; continue; }
++                        sum += v; sabs += std::fabs(v); ssq += (double) v * v;
++                        if (std::fabs(v) > mabs) mabs = std::fabs(v);
++                        n++;
++                    }
++    }
++    const char * bufname = t->buffer ? ggml_backend_buffer_name(t->buffer) : "?";
++    std::fprintf(g_ns_out, "%ld\t%s\t%s\t%s\t%s\t[%lld,%lld,%lld,%lld]\t%.9g\t%.9g\t%.9g\t%.9g\t%ld\t%ld\t%ld\t%s\t%s\n",
++                 g_ns_idx++, t->name, ggml_op_desc(t), ggml_type_name(ty), bufname, (long long) t->ne[0],
++                 (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3], sum, sabs, mabs, std::sqrt(ssq), nan,
++                 inf, n, t->src[0] ? t->src[0]->name : "-", t->src[1] ? t->src[1]->name : "-");
++}
++} // namespace
++
+ bool RouterHook::c_eval(ggml_tensor * t, bool ask, void * user_data) {
+-    return static_cast<RouterHook *>(user_data)->on_eval(t, ask);
++    auto * h = static_cast<RouterHook *>(user_data);
++    if (!g_ns_init) {
++        g_ns_init = true;
++        if (const char * p = std::getenv("BMOE_NODESTATS")) g_ns_out = std::fopen(p, "w");
++    }
++    if (!g_ns_out || h->capturing_) return h->on_eval(t, ask);
++    if (ask) {
++        g_ns_inner_want = h->on_eval(t, true);
++        return true;
++    }
++    const bool r = g_ns_inner_want ? h->on_eval(t, false) : true;
++    ns_dump(t, h->device_arena_ != nullptr);
++    std::fflush(g_ns_out);
++    return r;
+ }
+ 
+ void RouterHook::set_compute_trace(bool on, bool per_layer) {

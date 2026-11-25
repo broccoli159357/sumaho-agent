@@ -1,0 +1,26 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index b9b8c5811..2b6138450 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1896,6 +1896,13 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+ 
+     // as in build_lora_mm: the folded weight reads the transformed input, the LoRA delta reads `cur`
+     ggml_tensor * cur_mm = build_hadamard_input(w, cur);
++    // 専門家ごとの倍率 (w_s) を後から掛ける重みは、行列積の途中の値が fp16 の上限 65504 を超えることがある
++    // (Inkling の NVFP4 由来 gate_up で最大 21 万)。fp16 で積を取る NPU (Hexagon HMX) ではそこで値があふれるので、
++    // 入力を 2 の累乗で縮めてから掛け、倍率を掛けるときに戻す。2 の累乗なので fp32 の CPU では結果は変わらない。
++    const float pre_div = w_s ? 32.0f : 1.0f;
++    if (w_s) {
++        cur_mm = ggml_scale(ctx0, cur_mm, 1.0f / pre_div);
++    }
+     // the experts in the MoE cache are selected by their slots
+     ggml_tensor * res = slots == nullptr ?
+         ggml_mul_mat_id(ctx0, w, cur_mm, ids) :
+@@ -1915,6 +1922,7 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
+         s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+         s = ggml_get_rows(ctx0, s, ids);
+         res = ggml_mul(ctx0, res, s);
++        res = ggml_scale(ctx0, res, pre_div);
+     }
+     for (const auto & lora : *loras) {
+         llama_adapter_lora_weight * lw = lora.first->get_weight(w);

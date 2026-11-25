@@ -1,0 +1,144 @@
+diff --git a/examples/CMakeLists.txt b/examples/CMakeLists.txt
+index 39f802d25..1354c4544 100644
+--- a/examples/CMakeLists.txt
++++ b/examples/CMakeLists.txt
+@@ -18,6 +18,7 @@ else()
+     add_subdirectory(debug)
+     add_subdirectory(embedding)
+     add_subdirectory(eval-callback)
++    add_subdirectory(node-stats)
+ 
+     add_subdirectory(gguf-hash)
+     add_subdirectory(gguf)
+diff --git a/examples/node-stats/CMakeLists.txt b/examples/node-stats/CMakeLists.txt
+new file mode 100644
+index 000000000..27285db49
+--- /dev/null
++++ b/examples/node-stats/CMakeLists.txt
+@@ -0,0 +1,4 @@
++set(TARGET llama-node-stats)
++add_executable(${TARGET} node-stats.cpp)
++target_link_libraries(${TARGET} PRIVATE llama-common llama ${CMAKE_THREAD_LIBS_INIT})
++target_compile_features(${TARGET} PRIVATE cxx_std_17)
+diff --git a/examples/node-stats/node-stats.cpp b/examples/node-stats/node-stats.cpp
+new file mode 100644
+index 000000000..d91959c59
+--- /dev/null
++++ b/examples/node-stats/node-stats.cpp
+@@ -0,0 +1,94 @@
++// 実モデルを1回だけ推論し、計算ノードごとの出力の要約（合計・絶対値合計・最大絶対値・NaN/Inf 数）を
++// 1行ずつ書き出す。CPU 実行と NPU 実行の結果を突き合わせて、最初にずれるノードを探すためのツール。
++#include "arg.h"
++#include "common.h"
++#include "log.h"
++#include "llama.h"
++#include "ggml.h"
++#include "ggml-backend.h"
++
++#include <clocale>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++struct stats_state {
++    FILE * out = nullptr;
++    long idx = 0;
++    std::vector<uint8_t> buf;
++};
++
++static float read_elem(const uint8_t * p, ggml_type t) {
++    switch (t) {
++        case GGML_TYPE_F32: return *(const float *) p;
++        case GGML_TYPE_F16: return ggml_fp16_to_fp32(*(const ggml_fp16_t *) p);
++        case GGML_TYPE_BF16: return ggml_bf16_to_fp32(*(const ggml_bf16_t *) p);
++        case GGML_TYPE_I32: return (float) *(const int32_t *) p;
++        default: return 0.0f;
++    }
++}
++
++static bool cb(struct ggml_tensor * t, bool ask, void * ud) {
++    if (ask) return true;
++    auto * st = (stats_state *) ud;
++    const ggml_type ty = t->type;
++    const bool readable = ty == GGML_TYPE_F32 || ty == GGML_TYPE_F16 || ty == GGML_TYPE_BF16 || ty == GGML_TYPE_I32;
++    const char * bufname = t->buffer ? ggml_backend_buffer_name(t->buffer) : "?";
++    double sum = 0, sabs = 0, mabs = 0, ssq = 0; long nan = 0, inf = 0, n = 0;
++    if (readable) {
++        const uint8_t * data;
++        if (ggml_backend_buffer_is_host(t->buffer)) {
++            data = (const uint8_t *) t->data;
++        } else {
++            st->buf.resize(ggml_nbytes(t));
++            ggml_backend_tensor_get(t, st->buf.data(), 0, ggml_nbytes(t));
++            data = st->buf.data();
++        }
++        for (int64_t i3 = 0; i3 < t->ne[3]; i3++)
++        for (int64_t i2 = 0; i2 < t->ne[2]; i2++)
++        for (int64_t i1 = 0; i1 < t->ne[1]; i1++)
++        for (int64_t i0 = 0; i0 < t->ne[0]; i0++) {
++            const float v = read_elem(data + i3*t->nb[3] + i2*t->nb[2] + i1*t->nb[1] + i0*t->nb[0], ty);
++            if (std::isnan(v)) { nan++; continue; }
++            if (std::isinf(v)) { inf++; continue; }
++            sum += v; sabs += std::fabs(v); ssq += (double) v * v; if (std::fabs(v) > mabs) mabs = std::fabs(v); n++;
++        }
++    }
++    // 列: idx name op type buffer shape sum sum_abs max_abs l2 nan inf n src0 src1
++    fprintf(st->out, "%ld\t%s\t%s\t%s\t%s\t[%lld,%lld,%lld,%lld]\t%.9g\t%.9g\t%.9g\t%.9g\t%ld\t%ld\t%ld\t%s\t%s\n",
++            st->idx++, t->name, ggml_op_desc(t), ggml_type_name(ty), bufname,
++            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
++            sum, sabs, mabs, std::sqrt(ssq), nan, inf, n,
++            t->src[0] ? t->src[0]->name : "-", t->src[1] ? t->src[1]->name : "-");
++    return true;
++}
++
++int main(int argc, char ** argv) {
++    std::setlocale(LC_NUMERIC, "C");
++    common_params params;
++    common_init();
++    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_COMMON)) return 1;
++    const char * outp = getenv("NODESTATS_OUT");
++    stats_state st;
++    st.out = fopen(outp ? outp : "nodestats.tsv", "w");
++    if (!st.out) { LOG_ERR("cannot open output\n"); return 1; }
++    llama_backend_init();
++    params.cb_eval = cb;
++    params.cb_eval_user_data = &st;
++    params.warmup = false;
++    auto init = common_init_from_params(params);
++    auto * model = init->model();
++    auto * ctx = init->context();
++    if (!model || !ctx) { LOG_ERR("init failed\n"); return 1; }
++    const llama_vocab * vocab = llama_model_get_vocab(model);
++    std::vector<llama_token> tokens = common_tokenize(ctx, params.prompt, llama_vocab_get_add_bos(vocab), true);
++    LOG_INF("tokens = %zu\n", tokens.size());
++    common_batch batch = common_batch_get_one(ctx, tokens);
++    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) { LOG_ERR("eval failed\n"); return 1; }
++    fclose(st.out);
++    LOG_INF("wrote %ld nodes\n", st.idx);
++    return 0;
++}
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 11bfa42a9..1c4a135bb 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10716,6 +10716,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+     std::default_random_engine rng(0);
+ 
++    // Inkling 2 Mini の専門家行列と同じ形・型だけを試す（TBO_INKLING=1 のとき）
++    if (getenv("TBO_INKLING")) {
++        for (int64_t n : {43, 64}) {
++            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K,   GGML_TYPE_F32, 128, 8, false, 2304, n, 2304)); // gate_up
++            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152)); // down
++            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0,   GGML_TYPE_F32, 128, 8, false, 2304, n, 1152)); // down
++        }
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, 64, 1152, 0, false, true));
++        return test_cases;
++    }
++
+     // unary ops
+     // TODO: add GGML_UNARY_OP_SOFTPLUS test that is sensitive to using `log1p(exp(x))` vs `log(exp(x) + 1)`
+     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {

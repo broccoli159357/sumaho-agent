@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ローカル推論サーバー（スマホ内 / 自宅PC via Tailscale）は http で動くことが多いため平文通信を許可する。
+  クラウドAPI（OpenAI / Anthropic / Google）は https のみを使う。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
